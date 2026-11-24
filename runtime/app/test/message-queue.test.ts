@@ -225,11 +225,15 @@ test('unknown or disconnected Desktop state waits without dropping the message',
 }));
 
 test('only a pre-dispatch busy check can return a submission to the queue', async () => fixture(async (path, track) => {
-  let attempts = 0;
-  const queue = track(new MessageQueue({ path, secret: 'secret', pollMs: 100_000, readState: idle,
+  let attempts = 0, ready = true;
+  const queue = track(new MessageQueue({ path, secret: 'secret', pollMs: 100_000,
+    readState: async () => ({ ready, previousTurnComplete: true }),
     deliver: async () => { if (!attempts++) throw new Error('desktop_queue_busy'); return { turnId: 'turn-1' }; } }));
   queue.enqueue(input('A'), 'phone'); await tick(queue);
   assert.equal(queue.list('a').entries[0].status, 'queued');
+  ready = false; await tick(queue);
+  assert.equal(queue.list('a').entries[0].error, undefined, 'recovered state clears a stale transient failure');
+  ready = true;
   await tick(queue); assert.equal(queue.list('a').entries.length, 0); assert.equal(attempts, 2);
 }));
 
@@ -238,6 +242,20 @@ test('invalid encryption keys cannot silently discard or replace the existing qu
   queue.enqueue(input('A'), 'phone'); const bytes = readFileSync(path);
   assert.throws(() => new MessageQueue({ path, secret: 'other', readState: idle, deliver: async () => assert.fail() }), /storage_unreadable/);
   assert.deepEqual(readFileSync(path), bytes);
+}));
+
+test('a later enqueue retains the completed-dispatch barrier even after the queue was empty', async () => fixture(async (path, track) => {
+  const barriers: Array<string | undefined> = [];
+  let calls = 0, completed = true;
+  const queue = track(new MessageQueue({ path, secret: 'secret', pollMs: 100_000,
+    readState: async (_id, previous) => { barriers.push(previous); return { ready: true, previousTurnComplete: completed }; },
+    deliver: async () => ({ turnId: 'submitted-' + ++calls }) }));
+  queue.enqueue(input('A'), 'phone'); await tick(queue);
+  assert.equal(queue.list('a').entries.length, 0);
+  completed = false;
+  queue.enqueue(input('B'), 'phone'); await tick(queue);
+  assert.equal(barriers.at(-1), 'submitted-1'); assert.equal(calls, 1);
+  completed = true; await tick(queue); assert.equal(calls, 2);
 }));
 
 test('native queue eligibility rejects pending turns, approvals, unknown and stale state', () => {

@@ -24,6 +24,7 @@ export class MessageQueue {
   private active = new Map<string, Promise<void>>();
   private operations = new Map<string, Promise<any>>();
   private holds = new Map<string, number>();
+  private waitingErrors = new Map<string, string>();
   private stopped = false;
 
   constructor(private options: Options) {
@@ -73,7 +74,8 @@ export class MessageQueue {
   list(threadId: string) {
     if (!threadId) throw new Error('thread_id_required');
     return { threadId, paused: Boolean(this.data.paused?.[threadId]), entries: this.data.entries.filter(e => e.threadId === threadId)
-      .map(({ id, text, imagePath, createdAt, status, error }) => ({ id, text, hasImage: Boolean(imagePath), createdAt, status, error })) };
+      .map(({ id, text, imagePath, createdAt, status, error }) => ({ id, text, hasImage: Boolean(imagePath), createdAt, status,
+        error: error || this.waitingErrors.get(id) })) };
   }
 
   async setPaused(threadId: string, paused: boolean) {
@@ -184,7 +186,13 @@ export class MessageQueue {
     if (!head || head.status !== 'queued') return;
     let state;
     try { state = await this.options.readState(threadId, this.data.barriers[threadId]); }
-    catch { return; } // Offline, unknown and unreadable state all wait.
+    catch (error) { this.waitingErrors.set(head.id, String((error as Error).message)); return; }
+    this.waitingErrors.delete(head.id);
+    // A recovered connection must not keep showing a stale send failure while
+    // the task is simply busy. Blocked/uncertain submissions are never cleared.
+    if (head.status === 'queued' && head.error && this.data.entries.includes(head)) {
+      delete head.error; this.save();
+    }
     if (this.stopped || this.holds.has(threadId) || this.data.paused?.[threadId] || !state.ready || !state.previousTurnComplete || !this.data.entries.includes(head)
       || head.status !== 'queued') return;
     await this.dispatchEntry(head, this.options.deliver).catch(() => {});
@@ -199,19 +207,21 @@ export class MessageQueue {
         ...(head.imagePath ? { imagePath: head.imagePath } : {}) });
       if (!result.turnId) throw new Error('desktop_delivery_unknown');
       this.data.entries = this.data.entries.filter(e => e !== head);
-      if (this.data.entries.some(e => e.threadId === threadId)) this.data.barriers[threadId] = result.turnId;
-      else delete this.data.barriers[threadId];
+      // A later enqueue can beat Desktop's transition from idle to active.
+      this.data.barriers[threadId] = result.turnId;
+      this.waitingErrors.delete(head.id);
       this.data.receipts.push({ id: head.id, fingerprint: head.fingerprint, threadId, turnId: result.turnId });
       this.data.receipts = this.data.receipts.slice(-2000);
       this.save();
       return result;
     } catch (error) {
-      // Only a pre-dispatch busy check is safe to repeat. Every other failure
-      // stays visible and holds this thread's later messages for user review.
+      // These errors prove that no user input was handed to the host. Retry
+      // them after reconnection; uncertain dispatches must stay blocked.
       const message = (error as Error).message;
       if (!this.data.entries.includes(head)) this.data.entries.unshift(head);
-      head.status = message === 'desktop_queue_busy' ? 'queued' : 'blocked';
-      head.error = message === 'desktop_delivery_unknown' ? 'delivery_unknown' : 'delivery_failed';
+      const retry = ['desktop_queue_busy', 'desktop_input_unavailable', 'desktop_input_not_ready', 'desktop_input_settings_failed'].includes(message);
+      head.status = retry ? 'queued' : 'blocked';
+      head.error = message === 'desktop_delivery_unknown' ? 'delivery_unknown' : message || 'delivery_failed';
       this.save();
       throw error;
     }

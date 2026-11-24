@@ -89,6 +89,7 @@ export function MessageQueuePanel({ entries, error, online, paused = false, onRe
     <ol>{entries.map(entry => <li key={entry.id}>
       <div className="message-queue-content">
         <span className="message-queue-text">{entry.hasImage ? '▧ ' : ''}{entry.text}</span>
+        {entry.status === 'queued' && entry.error && <small role="status">{t('等待连接恢复，消息已保存，将自动重试：', 'Message saved; retrying when the connection recovers: ')}{friendlyError(new Error(entry.error))}</small>}
         {entry.status !== 'queued' && <small>{entry.status === 'sending'
           ? t('正在发送…', 'Sending…') : entry.error === 'delivery_unknown'
             ? t('发送结果待确认，后续消息已暂停。请检查对话，再取消此条以免重复。', 'Delivery is uncertain; later messages are paused. Check the conversation, then remove this entry to avoid duplicates.')

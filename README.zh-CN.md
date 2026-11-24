@@ -28,6 +28,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Setup.ps1
 
 Windows 桥接在可见的 PowerShell 窗口前台运行。需要远程访问时保持窗口打开。停止桥接不会停止桌面 Codex 已在执行的任务，但手机和 Linux 暂时无法连接。
 
+输入框中按 **Enter** 将消息加入队列，**Shift+Enter** 换行，**Ctrl+Enter** 立即引导当前任务（空闲时开始新一轮；macOS 可用 Command+Enter）。输入框为空时按 **↑ / ↓** 浏览本浏览器成功提交过的最近 200 条输入，选中后可编辑或再次发送；刷新仍会保留。已有草稿时方向键保持普通光标操作。
+
+排队确认表示消息已保存到 Windows，当前任务完成后才会依次投递。连接暂时不可用时保留队列并自动重试；若显示“发送结果待确认”，请先核对对话，避免重复提交。更新桥接后刷新远程网页即可，无需重新配对。
+
 ## 项目文档
 
 - [安装、Tailscale 配置和各平台使用说明](docs/INSTALL.zh-CN.md)

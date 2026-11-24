@@ -2,7 +2,8 @@ import { DesktopControls } from './desktop-controls.js';
 import { DesktopUserInput } from './desktop-user-input.js';
 import { readdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { NativePipeClient, encodeNativeFrame } from './desktop-native-pipe.js';
+import { NativePipeClient, NativeRequestError, encodeNativeFrame } from './desktop-native-pipe.js';
+import { desktopQueueState } from './desktop-queue-state.js';
 import { normalizeSessionName } from '../shared/session-name.js';
 
 // Desktop split app tools from browser control in newer builds. Prefer the
@@ -13,7 +14,8 @@ const STATUS_ENRICHMENT_TIMEOUT_MS = 1_000;
 const TASK_SCOPED_TOOLS = new Set(['send_message_to_thread', 'set_thread_title', 'read_thread', 'set_thread_archived']);
 
 type JsonObject = Record<string, any>;
-type DesktopClientOptions = { timeoutMs?: number };
+type QueueTurn = { id: string; status: string };
+type DesktopClientOptions = { timeoutMs?: number; readLatestTurn?(threadId: string): Promise<QueueTurn | null> };
 type DesktopMessage = {
   threadId: unknown;
   text: unknown;
@@ -26,6 +28,11 @@ export type DesktopThreadStatus = { id: string; status: string };
 type ToolCall = { tool: string; arguments: JsonObject; callerThreadId: string; callId: string };
 type DesktopHostError = Error & { code?: string };
 
+function appThreadReady(value: JsonObject) {
+  const status = value.thread.status;
+  return ['idle', 'completed'].includes(String(status?.type || status || 'unknown')) && !status?.activeFlags?.length;
+}
+
 export class CodexDesktopClient {
   timeoutMs: number;
   client: NativePipeClient | null;
@@ -33,11 +40,13 @@ export class CodexDesktopClient {
   private generation = 0;
   readonly userInput: DesktopUserInput;
   readonly controls: DesktopControls;
+  private readLatestTurn?: DesktopClientOptions['readLatestTurn'];
 
   constructor(options: DesktopClientOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
       ? Math.max(1_000, Number(options.timeoutMs)) : DEFAULT_TIMEOUT_MS;
     this.client = null;
+    this.readLatestTurn = options.readLatestTurn;
     this.userInput = new DesktopUserInput((threadId, timeoutMs) => this.openThread({ threadId }, timeoutMs), this.timeoutMs);
     this.controls = new DesktopControls(this.userInput);
   }
@@ -46,11 +55,99 @@ export class CodexDesktopClient {
     const targetThreadId = requireThreadId(threadId);
     const prompt = String(text || '').trim();
     if (!prompt) throw new Error('message_required');
-    await this.userInput.send({ threadId: targetThreadId, text: prompt, requestId, ...(imagePath ? { imagePath } : {}),
+    await this.deliverMessage({ threadId: targetThreadId, text: prompt, requestId, ...(imagePath ? { imagePath } : {}),
       model: String(model || '').trim() || undefined,
       thinking: String(thinking || '').trim() || undefined,
     });
     return { threadId: targetThreadId, delivery: 'desktop' };
+  }
+
+  // Some Desktop releases expose app-tools but no owner/follower IPC. Only
+  // switch transports after a proven pre-dispatch failure, never after a lost ACK.
+  async deliverMessage(input: { threadId: string; text: string; requestId: unknown; imagePath?: string;
+    model?: string; thinking?: string }, queued = false): Promise<{ turnId: string }> {
+    try { return await (queued ? this.userInput.startQueued(input) : this.userInput.steerQueued(input)); }
+    catch (error) {
+      if (!['desktop_input_unavailable', 'desktop_input_unsupported', 'desktop_input_not_ready'].includes((error as Error).message)) throw error;
+    }
+    if (input.imagePath) throw new Error('desktop_image_unsupported');
+    let before: JsonObject, previous: QueueTurn | null;
+    try {
+      before = await this.readAppThread(input.threadId, false);
+      if (queued && !appThreadReady(before)) throw new Error('desktop_queue_busy');
+      previous = await this.latestQueueTurn(input.threadId);
+      if (queued && previous?.status === 'inProgress') throw new Error('desktop_queue_busy');
+    }
+    catch (error) {
+      if ((error as Error).message === 'desktop_queue_busy') throw error;
+      throw new Error('desktop_input_unavailable');
+    }
+    const status = String(before.thread.status?.type || before.thread.status || 'unknown');
+    let result: JsonObject;
+    try {
+      result = await this.callTool({ tool: 'send_message_to_thread',
+        arguments: { threadId: input.threadId, prompt: input.text,
+          ...(input.model ? { model: input.model } : {}), ...(input.thinking ? { thinking: input.thinking } : {}) },
+        callerThreadId: input.threadId, callId: `bridge-input-${String(input.requestId)}` });
+    } catch (error) {
+      if (error instanceof NativeRequestError && error.dispatched) throw new Error('desktop_delivery_unknown');
+      throw new Error('desktop_input_unavailable');
+    }
+    // App-tools acknowledges submission, not the next turn ID. Keep a barrier
+    // until a different turn is observed completed; idle alone cannot drain FIFO.
+    let payload: JsonObject;
+    try { payload = parseToolPayload(result); } catch { throw new Error('desktop_delivery_unknown'); }
+    if (result.success !== true || payload.threadId !== input.threadId) throw new Error('desktop_delivery_unknown');
+    return { turnId: !queued && status === 'active' && previous?.id ? previous.id
+      : 'app-tools-after:' + Buffer.from(previous?.id || '').toString('base64url') };
+  }
+
+  async readAppThread(threadId: string, includeTurns = true): Promise<JsonObject> {
+    const result = await this.callTool({ tool: 'read_thread', arguments: {
+      threadId, includeTurns, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 1_000,
+    }, callerThreadId: threadId, callId: `bridge-state-${randomUUID()}` });
+    if (result.success !== true) throw new Error('desktop_thread_read_failed');
+    let value: JsonObject;
+    try { value = parseToolPayload(result); } catch { throw new Error('desktop_thread_read_failed'); }
+    if (value.thread?.id !== threadId || !Array.isArray(value.turns)) throw new Error('desktop_thread_read_failed');
+    return value;
+  }
+
+  private async latestQueueTurn(threadId: string): Promise<QueueTurn | null> {
+    // The connector already reads bounded rollout tails. Their lifecycle IDs
+    // avoid loading a single huge turn through the size-limited app-tools host.
+    if (this.readLatestTurn) return this.readLatestTurn(threadId);
+    const value = await this.readAppThread(threadId), turn = value.turns[0];
+    return turn ? { id: String(turn.id), status: String(turn.status) } : null;
+  }
+
+  async queueState(threadId: string, previousTurnId?: string) {
+    try {
+      const state = (await this.controls.snapshot(threadId, true, true)).state;
+      if (!previousTurnId?.startsWith('app-tools-after:')) return desktopQueueState(state, previousTurnId);
+    }
+    catch (error) {
+      if (!['desktop_input_unavailable', 'desktop_input_unsupported', 'desktop_input_not_ready'].includes((error as Error).message)) throw error;
+    }
+    const value = await this.readAppThread(threadId, false);
+    const ready = appThreadReady(value);
+    if (!ready || !previousTurnId) return { ready, previousTurnComplete: !previousTurnId };
+    const turn = await this.latestQueueTurn(threadId);
+    const completed = Boolean(turn && ['completed', 'interrupted', 'failed'].includes(turn.status));
+    const baseline = previousTurnId?.startsWith('app-tools-after:')
+      ? Buffer.from(previousTurnId.slice('app-tools-after:'.length), 'base64url').toString() : null;
+    const previousTurnComplete = completed && (baseline !== null ? turn!.id !== baseline : turn!.id === previousTurnId);
+    return { ready: ready && turn?.status !== 'inProgress', previousTurnComplete };
+  }
+
+  async readHistory(threadId: string) {
+    try { return await this.controls.readHistory(threadId); }
+    catch (error) {
+      if (!['desktop_input_unavailable', 'desktop_input_unsupported', 'desktop_input_not_ready'].includes((error as Error).message)) throw error;
+    }
+    // read_thread returns bounded previews, not complete message snapshots.
+    // Keep the full rollout page instead of replacing it with clipped output.
+    return null;
   }
 
   async renameThread({ threadId, name }: {

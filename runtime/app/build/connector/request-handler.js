@@ -55,7 +55,8 @@ export function createRequestHandler({ codex, desktop, attachments, fileUploads,
                 codex, desktop, attachments, fileUploads, visualizations, downloads, deviceId, deviceLabel, mode, browser, messageQueue,
                 networkAccess, allowFullAccess, getDesktopStatuses, refreshDesktopThreads,
             });
-            const operation = () => ['session.compact', 'session.plan', 'session.pin', 'session.move', 'turn.stop'].includes(action)
+            const operation = () => (['session.compact', 'session.plan', 'session.pin', 'session.move', 'turn.stop', 'turn.steer'].includes(action)
+                || action === 'turn.start' && payload.deliveryMode === 'steer')
                 && messageQueue?.runOperation && requestId && (clientDeviceId || clientId)
                 ? messageQueue.runOperation(String(clientDeviceId || clientId), requestId, { action, payload }, run) : run();
             const data = await (MEASURED_ACTIONS.has(action) ? measureOperation(action, operation) : operation());
@@ -264,7 +265,8 @@ async function dispatchAction({ action, payload, requestId, clientId, clientDevi
             return page;
         // Disk writes can lag an entire compaction. The owner has the accepted input,
         // compaction lifecycle and streamed summaries before they are persisted.
-        const [history, native] = await Promise.allSettled([page, desktop.controls.readHistory(threadId)]);
+        const [history, native] = await Promise.allSettled([page, desktop.readHistory
+                ? desktop.readHistory(threadId) : desktop.controls.readHistory(threadId)]);
         if (history.status === 'rejected')
             throw history.reason;
         return mergeDesktopHistoryPage(history.value, native.status === 'fulfilled' ? native.value : null);

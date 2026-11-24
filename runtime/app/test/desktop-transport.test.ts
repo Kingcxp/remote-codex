@@ -138,7 +138,9 @@ test('closing a connecting pipe rejects immediately and cannot resurrect it', as
 test('failure before dispatch is unavailable, not unknown delivery', async () => {
   const desktop = new CodexDesktopClient();
   desktop.userInput.pipe.request = async () => { throw new NativeRequestError('connect timeout', false); };
+  desktop.callTool = async () => { throw new Error('desktop_app_unavailable'); };
   await assert.rejects(desktop.sendMessage({ threadId: 'fixture', text: 'one', requestId: 'one' }), /^Error: desktop_input_unavailable$/);
+  desktop.close();
 });
 
 test('probe requires the correct namespace and operation dispatch checks cached capabilities', async () => {

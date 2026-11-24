@@ -1,5 +1,6 @@
 # Per-host state: DPAPI secrets, connector identity, pairings, queues, logs, backups.
 /state/
+/runtime/update/
 
 # Local device configuration and credentials.
 /config/*.pub

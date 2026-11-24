@@ -48,6 +48,7 @@ import { t } from './i18n';
 import { adoptDeliveryThread, confirmedDelivery, useDeliveryNotice, visibleDelivery, type MessageDelivery } from './message-delivery';
 import { DesktopQueuePanel, MessageQueuePanel, useMessageQueue } from './message-queue';
 import { UserInputCard } from './user-input-card';
+import { ComposerHistory, composerAction } from './composer-input';
 import { useWorkspaceLibrary, WorkspaceLibraryDialog } from './workspace-library';
 import { CodexCommands } from './codex-commands';
 import { GoalStatus } from './goal-status';
@@ -1793,15 +1794,27 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
   }, [sessions, workspace.data]);
   useEffect(() => { setLibraryTab(null); setCommandsOpen(false); }, [environmentId, threadId]);
   const { refreshQueue } = messageQueue;
+  const inputHistory = useRef(new ComposerHistory());
+  const inputHistoryKey = JSON.stringify(['bridge.inputHistory.v1', environmentId]);
+  useEffect(() => {
+    let entries: string[] = [];
+    try { const saved = JSON.parse(localStorage.getItem(inputHistoryKey) || '[]');
+      if (Array.isArray(saved)) entries = saved.filter((value): value is string => typeof value === 'string'); } catch { /* memory history still works */ }
+    inputHistory.current.seed(entries);
+  }, [inputHistoryKey]);
+  const rememberInput = (text: string) => {
+    inputHistory.current.record(text);
+    try { localStorage.setItem(inputHistoryKey, JSON.stringify(inputHistory.current.values())); } catch { /* storage may be disabled */ }
+  };
 
-  const sendTurn = useCallback(async (questionReplies?: QuestionReply[]) => {
+  const sendTurn = useCallback(async (questionReplies?: QuestionReply[], deliveryMode: 'queue' | 'steer' = 'queue') => {
     // A question response is independent of the message/attachment draft.
     if (questionReplies && (!threadId || threadId !== threadIdRef.current)) return;
     const text = questionReplies ? buildQuestionReply(questionReplies) : prompt.trim();
     const attachment = questionReplies ? null : pendingAttachment;
     const targetThreadId = threadIdRef.current;
     const sendKey = JSON.stringify([environmentIdRef.current, targetThreadId || NEW_TURN_KEY]);
-    const queueing = !questionReplies && Boolean(targetThreadId && connectorStatus?.capabilities.messageQueue);
+    const queueing = !questionReplies && deliveryMode !== 'steer' && Boolean(targetThreadId && connectorStatus?.capabilities.messageQueue);
     if (!questionReplies && !attachment && targetThreadId && /^\/(compact|plan|goal|stop)(?:\s|$)/i.test(text)) {
       if (!connectorStatus?.capabilities.desktopCommands) { reportTimelineError(new Error('desktop_command_unsupported')); return; }
       if (sendingRef.current.has(sendKey)) return;
@@ -1860,7 +1873,7 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
       (!text && !attachment)
       || uploading
       || sendingRef.current.has(sendKey)
-      || (running && !steering && !queueing)
+      || (running && !steering && !queueing && deliveryMode !== 'steer')
       || (steering && Boolean(attachment))
     ) return;
     const isExistingSession = Boolean(targetThreadId);
@@ -1962,6 +1975,7 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
         });
         if (data.delivery !== 'queue' || !data.queueId) throw new Error('message_queue_unconfirmed');
         const receipt = { ...confirmedDelivery(delivery, data.threadId), status: 'queued' as const };
+        rememberInput(text);
         if (visibleDelivery(receipt, environmentIdRef.current, threadIdRef.current, selectedRequestRef.current)) setMessageDelivery(receipt);
         void refreshQueue();
         return true;
@@ -1990,7 +2004,7 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
       const action = steering ? 'turn.steer' : 'turn.start';
       const data = await request<TurnStartResult>(action, {
         text: turnText,
-        ...(questionReplies ? { deliveryMode: 'steer' } : {}),
+        ...(!queueing ? { deliveryMode: 'steer' } : {}),
         ...(nativeImage ? { image: nativeImage } : {}),
         threadId: targetThreadId,
         ...(steering ? {} : {
@@ -2007,6 +2021,7 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
         setTimeline((current) => acknowledgeOptimisticUser(current, optimisticItemId, sentAt));
       }
       const receipt = confirmedDelivery(delivery, data.threadId);
+      if (!questionReplies) rememberInput(text);
       const selectionStillCurrent = isCurrentSessionRequest(
         targetThreadId, threadIdRef.current, selectionVersion, selectedRequestRef.current,
       ) || Boolean(visibleDelivery(receipt, environmentIdRef.current, threadIdRef.current, selectedRequestRef.current));
@@ -2107,7 +2122,7 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
     addTimeline, connectorStatus, executionState, modelConfig, newSessionCwd, ownedTurnThreadId, pendingAttachment,
     permissionConfig, prompt, threadId,
     loadHistory, refreshSessions, rememberAttachment, rememberImage, reportTimelineError, request, resetExecution, running,
-    updateExecution, updateSessionAttention, uploading, refreshQueue,
+    updateExecution, updateSessionAttention, uploading, refreshQueue, inputHistoryKey,
   ]);
 
   const openMessageEditor = useCallback((item: TimelineItem) => {
@@ -2799,9 +2814,17 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
                 event.preventDefault();
                 void chooseAttachment(file);
               }}
-              onChange={(event) => setPrompt(event.target.value)}
+              onChange={(event) => { inputHistory.current.reset(); setPrompt(event.target.value); }}
               onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
-                if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') void sendTurn();
+                if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+                if (!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey
+                  && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+                  const value = inputHistory.current.navigate(event.key, event.currentTarget.value);
+                  if (value !== null) { event.preventDefault(); setPrompt(value); }
+                  return;
+                }
+                const action = composerAction({ ...event, isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode });
+                if (action) { event.preventDefault(); if (online && !uploading) void sendTurn(undefined, action); }
               }}
               placeholder={uploading
                 ? t('正在上传附件…', 'Uploading attachment…')
@@ -2847,7 +2870,8 @@ export default function App({ initialPairingInput = null }: { initialPairingInpu
             ? t('运行中自动排队 · 当前任务结束后依次发送 · 可在上方取消', 'Messages wait for the current task, then send in order. Remove them above.')
             : steeringAvailable
             ? t('运行中可继续追加文字指令', 'You can steer this run with another text instruction')
-            : t('Ctrl/⌘+V 粘贴图片 · Ctrl/⌘+Enter 发送', 'Ctrl/⌘+V to paste an image · Ctrl/⌘+Enter to send')}</small>
+            : t('Ctrl/⌘+V 粘贴图片', 'Ctrl/⌘+V to paste an image')}
+            {' · '}{t('Enter 排队发送 · Shift+Enter 换行 · Ctrl/⌘+Enter 立即引导 · 空输入 ↑↓ 历史', 'Enter queues · Shift+Enter adds a line · Ctrl/⌘+Enter guides now · ↑↓ recalls history from an empty input')}</small>
         </footer>}
       </section>
     </main>

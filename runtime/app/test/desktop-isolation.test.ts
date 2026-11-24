@@ -57,7 +57,7 @@ test('only explicit confirmation allows archiving an actual Desktop approval wai
 test('user input snapshots only the selected destination and explicit model overrides', async () => {
   const { desktop, calls } = captureDesktop();
   const inputs: any[] = [];
-  desktop.userInput.send = async input => { inputs.push(input); };
+  desktop.userInput.steerQueued = async input => { inputs.push(input); return { turnId: 'native-turn' }; };
   const input = { threadId: 'thread-a', text: 'Message A', requestId: 'a', callerThreadId: 'unrelated-thread' };
   await Promise.all([desktop.sendMessage(input), desktop.sendMessage({ threadId: 'thread-b', text: 'Message B', requestId: 'b', model: 'gpt-6-astra', thinking: 'high' })]);
   assert.deepEqual(inputs, [
@@ -139,7 +139,7 @@ test('a native call snapshots its validated target before waiting for the pipe',
 test('user input failure is preserved without falling back to a delegation tool', async () => {
   const { desktop, calls } = captureDesktop();
   let attempts = 0;
-  desktop.userInput.send = async () => { attempts++; throw new Error('desktop_delivery_unknown'); };
+  desktop.userInput.steerQueued = async () => { attempts++; throw new Error('desktop_delivery_unknown'); };
   await assert.rejects(desktop.sendMessage({ threadId: 'target', text: 'hello', requestId: 'test' }), /desktop_delivery_unknown/);
   assert.equal(attempts, 1); assert.equal(calls.length, 0);
   assert.match(friendlyError(new Error('desktop_thread_identity_mismatch')), /已阻止操作.*会话身份不一致/);

@@ -1169,7 +1169,7 @@ function mapRolloutRowsWithState(
     const payload = row?.payload || {};
     const payloadType = String(payload.type || '');
     currentTurnId = rolloutRowTurnId(row) || currentTurnId;
-    const turn = { id: String(payload.id || payload.item?.id || createHash('sha256').update(JSON.stringify(row)).digest('hex').slice(0, 24)),
+    const turn = { ...(payload.id || payload.item?.id ? { id: String(payload.id || payload.item.id) } : {}),
       ...(currentTurnId ? { turnId: currentTurnId } : {}) };
     if (payloadType === 'task_started') {
       turnItemStart = items.length;
@@ -1210,7 +1210,8 @@ function mapRolloutRowsWithState(
       || (row?.type === 'response_item' && payloadType === 'reasoning')) {
       const summary = typeof payload.text === 'string' ? payload.text
         : (Array.isArray(payload.summary) ? payload.summary.map((v: RolloutRow) => typeof v === 'string' ? v : v.text || '').join('\n') : '');
-      if (summary) pushText(items, { type: 'reasoning', phase: 'analysis', text: summary, ...turn, ...timing });
+      if (summary) pushText(items, { type: 'reasoning', phase: 'analysis', text: summary,
+        ...(typeof payload.id === 'string' ? { id: payload.id } : {}), ...turn, ...timing });
     } else if (row?.type === 'event_msg' && payloadType === 'agent_message') {
       const content = rolloutAssistantMessage(payload.message, payload.phase);
       if (content.phase === 'final_answer') flushToolSummary(turn, timing);
@@ -1232,7 +1233,8 @@ function mapRolloutRowsWithState(
         const content = rolloutAssistantMessage(extractContent(payload.content), payload.phase);
         if (content.phase === 'final_answer') flushToolSummary(turn, timing);
         pushText(items, {
-          ...content, ...finalFileChanges(content.phase, progress), ...turn, ...timing,
+          ...content, ...(typeof payload.id === 'string' ? { id: payload.id } : {}),
+          ...finalFileChanges(content.phase, progress), ...turn, ...timing,
         });
       }
     } else if (row?.type === 'event_msg' && /^(?:image_generation_end|item_completed)$/.test(payloadType)) {
@@ -1342,11 +1344,21 @@ function rolloutAssistantMessage(value: unknown, phase?: string) {
     ...parseAssistantMessage(plan ?? value) };
 }
 
+const generatedRolloutItems = new WeakSet<RolloutItem>();
+
 function pushText(items: RolloutItem[], item: RolloutItem) {
   const text = /user/i.test(item.type) || item.phase === 'final_answer' ? fullText(item.text) : capText(item.text);
   if (!text && !item.attachment && !item.compaction && !item.notice && !item.questions) return;
+  // Native read_thread and repeated rollout records carry the same item ID.
+  // Keep it across polling/pagination so a changed timestamp or growing summary
+  // updates one message rather than creating a second copy.
+  if (item.id) {
+    const index = items.findIndex(previous => previous.id === item.id && previous.turnId === item.turnId && previous.type === item.type);
+    if (index >= 0) { items[index] = { ...items[index], ...item, text }; return; }
+  }
   const previous = items.at(-1);
   if (previous?.type === item.type
+    && (!item.id || !previous.id || previous.id === item.id || generatedRolloutItems.has(previous))
     && previous.turnId === item.turnId
     && previous.phase === item.phase
     && previous.text === text
@@ -1356,10 +1368,14 @@ function pushText(items: RolloutItem[], item: RolloutItem) {
     && JSON.stringify(previous.questions) === JSON.stringify(item.questions)
     && JSON.stringify(previous.questionReplies) === JSON.stringify(item.questionReplies)
     && JSON.stringify(previous.contexts || []) === JSON.stringify(item.contexts || [])) {
+    if (item.id) { previous.id = item.id; generatedRolloutItems.delete(previous); }
     if (item.fileChanges) previous.fileChanges = item.fileChanges;
     return;
   }
-  items.push({ ...item, text, status: '', name: '', input: '', output: '' });
+  const mapped = { ...item, id: item.id || createHash('sha256').update(JSON.stringify(item)).digest('hex').slice(0, 24),
+    text, status: '', name: '', input: '', output: '' };
+  if (!item.id) generatedRolloutItems.add(mapped);
+  items.push(mapped);
 }
 
 function toolCallFromRow(row: RolloutRow) {

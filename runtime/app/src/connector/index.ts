@@ -17,7 +17,6 @@ import { monitorConnectorSocket, scheduleReferencedRetry } from './reconnect.js'
 import { ConnectorSecureChannels } from './secure-channels.js';
 import { connectorSessionModelSettingsPath } from './session-model-settings.js';
 import { MessageQueue } from './message-queue.js';
-import { desktopQueueState } from './desktop-queue-state.js';
 import { createConnectorAuthProof } from '../shared/auth.js';
 import { createDeviceAuthProof } from '../shared/device-auth.js';
 import {
@@ -54,21 +53,28 @@ const codex = new CodexAppServer({
   allowFullAccess,
   modelSettingsPath: connectorSessionModelSettingsPath(deviceId),
 });
-const desktop = mode === 'desktop' ? new CodexDesktopClient() : null;
+const desktop = mode === 'desktop' ? new CodexDesktopClient({
+  readLatestTurn: async threadId => {
+    const page = await codex.listSessionTurns(threadId, { mode: 'live', limit: 1 });
+    const turn = page.turns[0];
+    const id = (page as any).activityId || turn?.id;
+    if (!id || /^(tail|rollout):/.test(id)) throw new Error('desktop_thread_read_failed');
+    return { id, status: turn?.status || 'unknown' };
+  },
+}) : null;
 const messageQueue = desktop ? new MessageQueue({
   path: process.env.BRIDGE_MESSAGE_QUEUE_FILE || connectorSessionModelSettingsPath(deviceId) + '.queue.enc.json',
   secret: deviceIdentity.privateKey,
   readState: async (threadId, previousTurnId) => {
     if (codex.getActiveTurn(threadId)) return { ready: false, previousTurnComplete: false };
     await codex.prepareDesktopTurn();
-    const { state } = await desktop.controls.snapshot(threadId, true, true);
-    const readiness = desktopQueueState(state, previousTurnId);
+    const readiness = await desktop.queueState(threadId, previousTurnId);
     if (!readiness.ready) return readiness;
     const nativeQueue = await desktop.controls.readQueue(threadId);
     return { ...readiness, ready: nativeQueue.available && nativeQueue.entries.length === 0 };
   },
-  deliver: input => desktop.userInput.startQueued(input),
-  steer: async input => { await codex.prepareDesktopTurn(); return desktop.userInput.steerQueued(input); },
+  deliver: input => desktop.deliverMessage(input, true),
+  steer: async input => { await codex.prepareDesktopTurn(); return desktop.deliverMessage(input); },
 }) : undefined;
 const downloads = new DownloadManager({
   allowedRoots: [...allowedRoots, generatedImagesDirectory(), visualizationsDirectory(), UPLOAD_DIRECTORY],

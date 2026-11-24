@@ -426,7 +426,7 @@ test('desktop native pipe frames use a little-endian length prefix', () => {
 test('desktop follow-up delivers native user input with the selected settings', async () => {
   const desktop = new CodexDesktopClient();
   let input;
-  desktop.userInput.send = async value => { input = value; };
+  desktop.userInput.steerQueued = async value => { input = value; return { turnId: 'native-turn' }; };
   assert.deepEqual(await desktop.sendMessage({ threadId: 'target-thread', text: '普通用户消息', requestId: 'request-1',
     model: 'gpt-6-astra', thinking: 'high' }), { threadId: 'target-thread', delivery: 'desktop' });
   assert.deepEqual(input, { threadId: 'target-thread', text: '普通用户消息', requestId: 'request-1', model: 'gpt-6-astra', thinking: 'high' });

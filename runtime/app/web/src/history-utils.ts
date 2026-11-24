@@ -184,6 +184,11 @@ function sameSourceItem(a: TimelineItem, b: TimelineItem) {
     && a.historyTurnId && a.historyTurnId === b.historyTurnId);
 }
 
+function differentSourceItems(a: TimelineItem, b: TimelineItem) {
+  return Boolean(a.historySource && a.historySource === b.historySource
+    && a.sourceItemId && b.sourceItemId && !sameSourceItem(a, b));
+}
+
 export function appendTimelineStream(items: TimelineItem[], stream: TimelineStream, delta: string, offset?: number) {
   const target: TimelineItem = { ...stream, text: '', transient: true };
   const index = items.findIndex(item => sameSourceItem(item, target) || item.id === stream.id);
@@ -207,6 +212,8 @@ export function finishTimelineStream(items: TimelineItem[], stream: TimelineStre
     transient: true, completedAt, ...(itemId ? { sourceItemId: itemId } : {}),
     ...(turnId ? { historyTurnId: turnId } : {}), ...(fileChanges ? { fileChanges } : {}) };
   const index = items.findIndex(item => sameSourceItem(item, target)
+    || !itemId && turnId && item.historyTurnId === turnId && item.kind === 'assistant'
+      && !item.questions && messageIdentity(item) === messageIdentity(target)
     || item.id === stream?.id && (stream.kind === 'assistant' || item.sourceItemId === itemId
       || isDuplicateFinalProgress(item.text, content.text)));
   if (index < 0) return [...items, target];
@@ -463,7 +470,7 @@ export function mergeHistorySnapshot(
     // Rollout offsets and live-tail indexes change on each read. Keep the DOM
     // identity of the same persisted message, including its loaded image.
     const candidates = persistedIdentities.get(persistedSnapshotIdentity(item));
-    while (candidates?.length && claimedIds.has(candidates[0].id)) candidates.shift();
+    while (candidates?.length && (claimedIds.has(candidates[0].id) || differentSourceItems(candidates[0], item))) candidates.shift();
     let persisted = item.compaction || item.compactionProgress ? undefined
       : item.sourceItemId ? current.find(previous => !claimedIds.has(previous.id)
         && sameSourceItem(previous, item))
@@ -619,7 +626,7 @@ export function mergeHistorySnapshot(
   const omitted = current.filter((item) => !item.transient && !keep(item)
     && !compactions.matched.has(item.id)
     && !hydratedLatest.some((next) => next.id === item.id || sameSourceItem(item, next) || samePersistedMessage(item, next)
-      || (item.kind === 'progress' && next.kind === 'progress' && !item.attachment && !item.visualization
+      || (!differentSourceItems(item, next) && item.kind === 'progress' && next.kind === 'progress' && !item.attachment && !item.visualization
         && !next.attachment && !next.visualization
         && item.historyTurnId === next.historyTurnId && next.text.includes(item.text))));
   for (const item of omitted) {
@@ -651,7 +658,8 @@ function timelineTime(item: TimelineItem) {
 }
 
 function samePersistedMessage(previous: TimelineItem, next: TimelineItem) {
-  if (previous.transient || next.transient || messageIdentity(previous) !== messageIdentity(next)) return false;
+  if (previous.transient || next.transient || differentSourceItems(previous, next)
+    || messageIdentity(previous) !== messageIdentity(next)) return false;
   const before = timelineTime(previous);
   const after = timelineTime(next);
   if (before != null && after != null) return before === after
@@ -787,6 +795,9 @@ function persistedSnapshotIdentity(item: TimelineItem) {
     : Date.parse(String(rawTime));
   if (!Number.isFinite(completedAt)) return '';
   return [
+    // Preserve genuinely separate native messages even if text and times match.
+    item.sourceItemId ? item.historySource || '' : '',
+    item.sourceItemId ? item.historyTurnId || '' : '', item.sourceItemId || '',
     messageIdentity(item),
     String(completedAt),
     JSON.stringify(item.contexts || []),

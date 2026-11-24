@@ -22,6 +22,10 @@ On the Windows host, choose **Add a device** in `Setup.ps1` to create its per-de
 
 The Windows bridge runs in a visible PowerShell window. Keep it open while remote access is needed. Existing desktop Codex tasks continue if the bridge stops, but remote clients disconnect until it starts again.
 
+In the composer, **Enter** queues a message, **Shift+Enter** inserts a newline, and **Ctrl+Enter** immediately guides the current task (or starts a turn when idle; Command+Enter also works on macOS). With an empty composer, **Up/Down** recalls up to 200 successfully submitted inputs saved in that browser, including after a refresh. Editing a draft restores ordinary cursor navigation.
+
+Queue acceptance confirms durable storage on Windows; messages are delivered in order after the current turn finishes. Temporary connection failures retry automatically. An uncertain delivery remains held for review to avoid sending the same instruction twice. Refresh the remote page after an update; existing pairings remain valid.
+
 ## Guides
 
 - [Chinese installation and device guide](README.zh-CN.md)
