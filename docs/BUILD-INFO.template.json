@@ -1,0 +1,7 @@
+{
+  "project": "Remote Codex",
+  "upstream": "https://github.com/gaotong132/codex-anywhere",
+  "upstreamCommit": "6d3e507f2eb3cb660ce6752194e78e4f48ad63f3",
+  "applicationVersion": "0.4.5",
+  "sha256": {}
+}

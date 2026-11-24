@@ -1,0 +1,19 @@
+.message-queue { margin: 6px 16px; padding: 10px 12px; border: 1px solid #384456; border-radius: 10px; font-size: 12px; }
+.message-queue-heading { color: #b5c5dc; margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.message-queue-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; max-width: 130px; }
+.message-queue ol { margin: 0; padding: 0; list-style: none; max-height: 200px; overflow-y: auto; }
+.message-queue li { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.message-queue-content { flex: 1; min-width: 0; }
+.message-queue-text { display: block; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 72px; overflow-y: auto; user-select: text; }
+.message-queue small, .message-queue-error { display: block; color: #f0c78b; margin-top: 4px; }
+.message-queue button { flex-shrink: 0; padding: 4px 8px; border-radius: 6px; border: 1px solid #48556a; background: transparent; color: inherit; }
+.desktop-message-queue { max-height: 24vh; overflow-y: auto; }
+.desktop-message-queue summary { cursor: pointer; font-weight: 600; }
+.native-questions { max-height: 44vh; overflow-y: auto; flex-shrink: 0; padding: 0 16px; }
+.native-question-card { margin: 8px auto; max-width: 800px; }
+.native-question-hint { margin: 6px 0; font-size: 12px; opacity: .75; }
+.proposed-plan-label { margin-bottom: 10px; color: #9cbeff; font-size: 12px; font-weight: 600; }
+.desktop-sync-error { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid #665439; border-radius: 8px; color: #f0c78b; font-size: 12px; }
+.desktop-sync-error button { flex-shrink: 0; padding: 4px 6px; border: 1px solid currentColor; border-radius: 6px; color: inherit; background: transparent; }
+.native-question-card small { display: block; font-size: 12px; opacity: .75; }
+.native-question-card input[type=password] { width: 100%; padding: 8px; color: inherit; background: transparent; border: 1px solid #48556a; border-radius: 6px; }

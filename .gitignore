@@ -1,0 +1,37 @@
+# Per-host state: DPAPI secrets, connector identity, pairings, queues, logs, backups.
+/state/
+
+# Local device configuration and credentials.
+/config/*.pub
+/config/*private*
+/config/*secret*
+/config/*generated*.json
+/config/tailnet-policy.json
+/config/existing-project-roots.json
+
+# Locally generated deployment metadata and private troubleshooting history.
+/docs/BUILD-INFO.json
+/docs/VALIDATION.json
+/docs/LOCAL-CHANGES.patch
+/docs/ONBOARDING.zh-CN.md
+/docs/DEPLOYMENT.zh-CN.md
+/docs/NIXOS-ACCESS.zh-CN.md
+/docs/RUSTDESK.zh-CN.md
+/docs/REMOTE-WORKSPACE.zh-CN.md
+
+# Generated archives, dependencies, caches and diagnostics.
+/releases/
+/runtime/app/node_modules/
+/runtime/app/coverage/
+/runtime/app/.npm/
+**/*.log
+**/*.tsbuildinfo
+**/.DS_Store
+**/Thumbs.db
+
+# Environment credentials and local overrides.
+.env
+.env.*
+!.env.example
+*.local
+*.user

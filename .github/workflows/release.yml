@@ -1,0 +1,43 @@
+name: Publish deployment archive
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: runtime/app/package-lock.json
+      - name: Install app dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: runtime/app
+      - name: Type check, test, and build
+        run: .\scripts\Build-Application.ps1
+        shell: powershell
+      - name: Test Windows onboarding and script syntax
+        run: .\tests\Onboarding.Tests.ps1
+        shell: powershell
+      - name: Package and checksum
+        shell: powershell
+        run: |
+          if ((Get-Content .\VERSION -Raw).Trim() -ne $env:GITHUB_REF_NAME.Substring(1)) { throw 'Release tag and VERSION do not match.' }
+          .\scripts\Build-Release.ps1 -OutputDirectory $env:RUNNER_TEMP
+      - name: Publish GitHub release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Filter "Remote-Codex-$env:GITHUB_REF_NAME.zip" | Select-Object -First 1
+          if (-not $archive) { throw 'Release archive was not created.' }
+          gh release create $env:GITHUB_REF_NAME $archive.FullName ($archive.FullName + '.sha256') --repo $env:GITHUB_REPOSITORY --title "Remote Codex $env:GITHUB_REF_NAME" --generate-notes

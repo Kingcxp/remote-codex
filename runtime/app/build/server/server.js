@@ -1,0 +1,583 @@
+import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
+import { isIP } from 'node:net';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { LRUCache } from 'lru-cache';
+import sirv from 'sirv';
+import { WebSocketServer } from 'ws';
+import { createConnectorAuthProof, normalizeAuthDeviceId } from '../shared/auth.js';
+import { verifyDeviceAuthProof } from '../shared/device-auth.js';
+import { browserLinkContext } from '../shared/browser-link.js';
+import { BROWSER_PAIRING_ID_PATTERN, DEVICE_KEY_AUTH_CONTEXT, createBrowserPairingProof, } from '../shared/pairing-auth.js';
+import { createProtocolOffer, requireCurrentProtocol, } from '../shared/protocol-contract.js';
+import { DeviceRegistry } from './device-registry.js';
+import { ACTIVITY_INTERVAL_MS, DeviceActivity, deviceActivityPath } from './device-activity.js';
+import { currentWebSocketSource, handleHttpRequest, normalizeUiLanguage } from './http.js';
+import { MAX_FRAME_BYTES, createId, parseFrame, publicError, safeSend, secretMatches, } from '../shared/protocol.js';
+const moduleDir = resolve(fileURLToPath(new URL('.', import.meta.url)));
+const defaultPublicDir = resolve(moduleDir, '../../dist');
+const AUTH_FAILURE_LIMIT = 8;
+const AUTH_FAILURE_WINDOW_MS = 5 * 60_000;
+const AUTH_LOCK_MS = 15 * 60_000;
+const AUTH_MAX_TRACKED_ADDRESSES = 4_096;
+const AUTH_SESSION_MAX_AGE_MS = 60 * 60_000;
+export function createBridgeServer(options = {}) {
+    const extensionOrigins = options.extensionOrigins ?? (process.env.BRIDGE_EXTENSION_ORIGINS || '').split(',').map((value) => value.trim()).filter(Boolean);
+    if (extensionOrigins.some((origin) => !/^chrome-extension:\/\/[a-p]{32}$/.test(origin)))
+        throw new Error('invalid_extension_origin_allowlist');
+    const connectorToken = String(options.connectorToken || process.env.BRIDGE_CONNECTOR_TOKEN || '');
+    if (connectorToken.length < 32)
+        throw new Error('BRIDGE_CONNECTOR_TOKEN must contain at least 32 characters');
+    const publicDir = resolve(options.publicDir || defaultPublicDir);
+    const staticHandler = sirv(publicDir, {
+        dev: !existsSync(publicDir),
+        etag: true,
+        gzip: true,
+        brotli: true,
+        single: true,
+        setHeaders(response, pathname) {
+            const cacheableAsset = /\.[^/]+$/.test(pathname)
+                && !pathname.endsWith('.html');
+            response.setHeader('cache-control', cacheableAsset ? 'public, max-age=3600' : 'no-store');
+        },
+    });
+    const uiLanguage = normalizeUiLanguage(options.uiLanguage ?? process.env.CODEX_UI_LANGUAGE);
+    const configuredRegistryPath = options.deviceRegistryPath !== undefined
+        ? options.deviceRegistryPath
+        : process.env.BRIDGE_DEVICE_REGISTRY_FILE || (options.connectorToken ? null : resolve('data/devices.json'));
+    const deviceRegistry = options.deviceRegistry || new DeviceRegistry(configuredRegistryPath);
+    const deviceActivity = new DeviceActivity(deviceActivityPath(deviceRegistry.filePath), () => deviceRegistry.listApproved(), options.clock);
+    let activityTimer;
+    const connectors = new Map();
+    const clients = new Map();
+    const socketMeta = new WeakMap();
+    const trustProxy = options.trustProxy ?? process.env.BRIDGE_TRUST_PROXY === '1';
+    const sessionMaxAgeMs = positiveInteger(options.sessionMaxAgeMs ?? Number(process.env.BRIDGE_SESSION_MAX_AGE_MS), AUTH_SESSION_MAX_AGE_MS);
+    const heartbeatIntervalMs = positiveInteger(options.heartbeatIntervalMs, 30_000);
+    const authLimiter = new AuthFailureLimiter({
+        limit: options.authFailureLimit,
+        windowMs: options.authFailureWindowMs,
+        lockMs: options.authLockMs,
+        maxEntries: options.authMaxEntries,
+        clock: options.clock,
+    });
+    let pairingGeneration = deviceRegistry.getPairingGeneration();
+    const refreshPairingGeneration = () => {
+        const current = deviceRegistry.getPairingGeneration();
+        if (current === pairingGeneration)
+            return;
+        authLimiter.entries.clear();
+        pairingGeneration = current;
+    };
+    const httpServer = createServer((request, response) => {
+        handleHttpRequest({
+            request, response, trustProxy, uiLanguage, staticHandler, extensionOrigins,
+        });
+    });
+    const webSocketServer = new WebSocketServer({
+        noServer: true,
+        maxPayload: MAX_FRAME_BYTES,
+        perMessageDeflate: false,
+    });
+    httpServer.on('upgrade', (request, socket, head) => {
+        let url;
+        try {
+            url = new URL(request.url || '/', 'http://localhost');
+        }
+        catch {
+            socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+        if (request.method !== 'GET' || url.pathname !== '/ws' || !originAllowed(request, extensionOrigins)) {
+            if (url.pathname === '/ws')
+                socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+        webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+            webSocketServer.emit('connection', webSocket, request);
+        });
+    });
+    webSocketServer.on('connection', (rawSocket, request) => {
+        const socket = rawSocket;
+        const clientAddress = getClientAddress(request, trustProxy);
+        refreshPairingGeneration();
+        if (authLimiter.isBlocked(clientAddress)) {
+            socket.close(4429, 'authentication temporarily locked');
+            return;
+        }
+        const authTimer = setTimeout(() => socket.close(4001, 'authentication timeout'), 10_000);
+        let sessionTimer;
+        authTimer.unref?.();
+        const authChallenge = randomBytes(32).toString('hex');
+        socket.isAlive = true;
+        socket.on('pong', () => { socket.isAlive = true; deviceActivity.seen(socket); });
+        socket.on('message', (data) => {
+            try {
+                const message = parseFrame(data);
+                const meta = socketMeta.get(socket);
+                if (!meta) {
+                    refreshPairingGeneration();
+                    if (authLimiter.isBlocked(clientAddress)) {
+                        socket.close(4429, 'authentication temporarily locked');
+                        return;
+                    }
+                    const authenticated = authenticateSocket({
+                        socket, message, connectorToken, authChallenge,
+                        connectors, clients, socketMeta, authTimer,
+                        authLimiter, clientAddress, deviceRegistry,
+                        extensionOrigin: extensionOrigins.includes(String(request.headers.origin)) ? String(request.headers.origin) : '',
+                    });
+                    if (authenticated) {
+                        const identity = socketMeta.get(socket);
+                        deviceActivity.connected(socket, identity.role, identity.device.id);
+                        sessionTimer = setTimeout(() => socket.close(4005, 'authentication expired'), sessionMaxAgeMs);
+                        sessionTimer.unref?.();
+                        broadcastPresence(clients, connectors, deviceRegistry);
+                    }
+                    return;
+                }
+                deviceActivity.seen(socket);
+                if (message.type === 'relay.request' && meta.role === 'client') {
+                    const requestId = String(message.requestId || '').slice(0, 128);
+                    try {
+                        if (!deviceRegistry.isApproved('client', meta.device))
+                            throw new Error('device_not_approved');
+                        if (message.action !== 'device.rename')
+                            throw new Error('unsupported_relay_action');
+                        const data = deviceRegistry.renameConnector(String(message.payload?.deviceId || ''), message.payload?.label);
+                        safeSend(socket, { type: 'relay.response', requestId, ok: true, data });
+                        broadcastPresence(clients, connectors, deviceRegistry);
+                    }
+                    catch (error) {
+                        safeSend(socket, { type: 'relay.response', requestId, ok: false, error: publicError(error) });
+                    }
+                    return;
+                }
+                if (message.type === 'ping') {
+                    safeSend(socket, { type: 'pong', at: Date.now() });
+                    return;
+                }
+                if (meta.role === 'client') {
+                    routeClientMessage({ socket, meta, message, connectors });
+                }
+                else {
+                    routeConnectorMessage({ message, clients, meta });
+                }
+            }
+            catch (error) {
+                safeSend(socket, { type: 'error', error: publicError(error) });
+            }
+        });
+        socket.on('close', () => {
+            clearTimeout(authTimer);
+            if (sessionTimer)
+                clearTimeout(sessionTimer);
+            deviceActivity.disconnected(socket);
+            const meta = socketMeta.get(socket);
+            if (!meta)
+                return;
+            if (meta.role === 'client') {
+                clients.delete(meta.id);
+                for (const connector of connectors.values()) {
+                    safeSend(connector, { type: 'client.disconnected', clientId: meta.id });
+                }
+            }
+            if (meta.role === 'connector' && connectors.get(meta.deviceId) === socket)
+                connectors.delete(meta.deviceId);
+            broadcastPresence(clients, connectors, deviceRegistry);
+        });
+        safeSend(socket, {
+            type: 'auth.challenge', challenge: authChallenge, protocol: createProtocolOffer(),
+        });
+    });
+    const heartbeat = setInterval(() => {
+        for (const rawSocket of webSocketServer.clients) {
+            const socket = rawSocket;
+            const meta = socketMeta.get(socket);
+            if (meta && !deviceRegistry.isApproved(meta.role, meta.device)) {
+                socket.close(4403, 'device approval revoked');
+                continue;
+            }
+            if (socket.isAlive === false) {
+                socket.terminate();
+                continue;
+            }
+            socket.isAlive = false;
+            socket.ping();
+        }
+        broadcastPresence(clients, connectors, deviceRegistry);
+    }, heartbeatIntervalMs);
+    heartbeat.unref?.();
+    return {
+        httpServer, webSocketServer, connectors, clients, deviceRegistry, deviceActivity,
+        async listen(port = 3300, host = '127.0.0.1') {
+            await new Promise((resolveListen, reject) => {
+                const onError = (error) => reject(error);
+                httpServer.once('error', onError);
+                httpServer.listen(port, host, () => {
+                    httpServer.off('error', onError);
+                    resolveListen();
+                });
+            });
+            deviceActivity.flush();
+            activityTimer = setInterval(() => deviceActivity.flush(), ACTIVITY_INTERVAL_MS);
+            activityTimer.unref?.();
+            return httpServer.address();
+        },
+        async close() {
+            clearInterval(heartbeat);
+            clearInterval(activityTimer);
+            deviceActivity.stop();
+            for (const socket of webSocketServer.clients)
+                socket.close(1001, 'server shutdown');
+            await new Promise((resolveClose) => httpServer.close(() => resolveClose()));
+        },
+    };
+}
+function authenticateSocket({ socket, message, connectorToken, authChallenge, connectors, clients, socketMeta, authTimer, authLimiter, clientAddress, deviceRegistry, extensionOrigin, }) {
+    const authType = String(message.type || '');
+    const role = message.role === 'connector' ? 'connector' : message.role === 'client' ? 'client' : '';
+    const deviceId = normalizeAuthDeviceId(message.deviceId);
+    let protocol;
+    try {
+        protocol = requireCurrentProtocol(message.protocol);
+    }
+    catch {
+        socket.close(4406, 'protocol version unsupported');
+        return false;
+    }
+    const device = message.device && typeof message.device === 'object'
+        ? message.device
+        : null;
+    if (!role) {
+        socket.close(4406, 'device authentication required');
+        return false;
+    }
+    let deviceAuthContext = '';
+    let browserPairing = null;
+    let authMode;
+    let sponsor = null;
+    if (authType === 'auth.connector' && role === 'connector') {
+        let expectedProof = '';
+        try {
+            expectedProof = createConnectorAuthProof(connectorToken, authChallenge, deviceId);
+        }
+        catch {
+            expectedProof = '';
+        }
+        if (!secretMatches(message.proof, expectedProof)) {
+            return rejectAuthentication(socket, authLimiter, clientAddress);
+        }
+        if (!device) {
+            socket.close(4406, 'device authentication required');
+            return false;
+        }
+        deviceAuthContext = String(message.proof || '');
+        authMode = 'connector-token';
+    }
+    else if (!device) {
+        socket.close(4406, 'device authentication required');
+        return false;
+    }
+    else if (authType === 'auth.device' && role === 'client') {
+        deviceAuthContext = DEVICE_KEY_AUTH_CONTEXT;
+        authMode = 'device';
+    }
+    else if (authType === 'auth.link' && role === 'client') {
+        sponsor = message.sponsor;
+        let valid = false;
+        try {
+            valid = Boolean(sponsor && extensionOrigin && deviceRegistry.isApproved('client', sponsor)
+                && verifyDeviceAuthProof(sponsor, { challenge: authChallenge, role: 'client',
+                    authProof: browserLinkContext(extensionOrigin, device) }));
+        }
+        catch { /* Invalid or differently scoped sponsor proof. */ }
+        if (!valid)
+            return rejectAuthentication(socket, authLimiter, clientAddress);
+        deviceAuthContext = DEVICE_KEY_AUTH_CONTEXT;
+        authMode = 'linked';
+    }
+    else if (authType === 'auth.enroll' && role === 'client') {
+        const pairingId = String(message.pairingId || '');
+        if (!BROWSER_PAIRING_ID_PATTERN.test(pairingId)) {
+            return rejectAuthentication(socket, authLimiter, clientAddress);
+        }
+        const verifier = deviceRegistry.getBrowserPairingVerifier(pairingId);
+        if (!verifier)
+            return rejectAuthentication(socket, authLimiter, clientAddress);
+        let expectedProof = '';
+        try {
+            expectedProof = createBrowserPairingProof({
+                verifier,
+                challenge: authChallenge,
+                pairingId,
+                deviceId: device.id,
+                publicKey: device.publicKey,
+            });
+        }
+        catch {
+            expectedProof = '';
+        }
+        if (!secretMatches(message.proof, expectedProof)) {
+            return rejectAuthentication(socket, authLimiter, clientAddress);
+        }
+        deviceAuthContext = String(message.proof || '');
+        browserPairing = { id: pairingId, verifier };
+        authMode = 'pairing';
+    }
+    else {
+        socket.close(4406, 'authentication method unsupported');
+        return false;
+    }
+    let deviceProofValid = false;
+    try {
+        deviceProofValid = verifyDeviceAuthProof(device, {
+            challenge: authChallenge,
+            role,
+            routeDeviceId: deviceId,
+            authProof: deviceAuthContext,
+        });
+    }
+    catch {
+        deviceProofValid = false;
+    }
+    if (!deviceProofValid) {
+        return rejectAuthentication(socket, authLimiter, clientAddress, 4407, 'device authentication failed');
+    }
+    authLimiter.recordSuccess(clientAddress);
+    if (sponsor) {
+        if (!deviceRegistry.approveLinkedBrowser(device, sponsor))
+            return rejectAuthentication(socket, authLimiter, clientAddress);
+    }
+    else if (browserPairing) {
+        const approved = deviceRegistry.approveBrowserPairing({
+            pairingId: browserPairing.id,
+            verifier: browserPairing.verifier,
+            device,
+            label: device.label,
+        });
+        if (!approved)
+            return rejectAuthentication(socket, authLimiter, clientAddress);
+    }
+    else if (!deviceRegistry.isApproved(role, device)) {
+        if (authMode === 'connector-token') {
+            deviceRegistry.requestPairing({
+                role,
+                routeDeviceId: deviceId,
+                device,
+                address: clientAddress,
+            });
+        }
+        safeSend(socket, {
+            type: 'auth.pairing',
+            role,
+            protocol,
+        });
+        socket.close(4403, 'device approval required');
+        return false;
+    }
+    clearTimeout(authTimer);
+    if (role === 'connector') {
+        try {
+            deviceRegistry.assertConnectorRoute(device, deviceId);
+        }
+        catch (error) {
+            safeSend(socket, { type: 'error', error: publicError(error) });
+            socket.close(4409, error.message);
+            return false;
+        }
+        const previous = connectors.get(deviceId);
+        const previousMeta = previous && socketMeta.get(previous);
+        if (previousMeta && (previousMeta.device.id !== device.id || previousMeta.device.publicKey !== device.publicKey)) {
+            socket.close(4409, 'device_route_conflict');
+            return false;
+        }
+        if (previous && previous !== socket)
+            previous.close(4004, 'connector replaced');
+        connectors.set(deviceId, socket);
+        socketMeta.set(socket, {
+            role, deviceId, device: { id: device.id, publicKey: device.publicKey },
+        });
+        safeSend(socket, { type: 'auth.ok', role, deviceId, protocol, authMode });
+        return true;
+    }
+    const id = createId('client');
+    clients.set(id, socket);
+    socketMeta.set(socket, {
+        role, id, device: { id: device.id, publicKey: device.publicKey },
+    });
+    safeSend(socket, {
+        type: 'auth.ok', role, clientId: id,
+        devices: [...connectors.keys()].sort(),
+        environments: connectorInventory(deviceRegistry, connectors),
+        protocol,
+        authMode,
+    });
+    return true;
+}
+function rejectAuthentication(socket, authLimiter, clientAddress, code = 4003, reason = 'authentication failed') {
+    const locked = authLimiter.recordFailure(clientAddress);
+    socket.close(locked ? 4429 : code, locked ? 'authentication temporarily locked' : reason);
+    return false;
+}
+function routeClientMessage({ socket, meta, message, connectors }) {
+    const deviceId = String(message.deviceId || 'personal-pc');
+    const connector = connectors.get(deviceId);
+    if (isSecureClientFrame(message.type)) {
+        if (!connector) {
+            safeSend(socket, { type: 'channel.error', error: 'connector_offline', deviceId });
+            return;
+        }
+        if (message.type === 'channel.offer') {
+            const initiator = message.offer?.initiator;
+            if (initiator?.id !== meta.device.id || initiator?.publicKey !== meta.device.publicKey) {
+                safeSend(socket, { type: 'channel.error', error: 'secure_channel_identity_mismatch', deviceId });
+                return;
+            }
+            safeSend(connector, { type: message.type, clientId: meta.id, offer: message.offer });
+            return;
+        }
+        if (message.type === 'channel.confirm') {
+            safeSend(connector, {
+                type: message.type, clientId: meta.id,
+                channelId: message.channelId, signature: message.signature,
+            });
+            return;
+        }
+        safeSend(connector, { type: message.type, clientId: meta.id, envelope: message.envelope });
+        return;
+    }
+    safeSend(socket, { type: 'error', requestId: message.requestId, error: 'secure_channel_required' });
+}
+function routeConnectorMessage({ message, clients, meta }) {
+    if (isSecureConnectorFrame(message.type)) {
+        const clientId = String(message.clientId || '');
+        const client = clients.get(clientId);
+        if (!client)
+            return;
+        if (message.type === 'channel.accept') {
+            const responder = message.accept?.transcript?.responder;
+            if (responder?.id !== meta.device.id || responder?.publicKey !== meta.device.publicKey)
+                return;
+            safeSend(client, { type: message.type, accept: message.accept, deviceId: meta.deviceId });
+            return;
+        }
+        if (message.type === 'channel.ready' || message.type === 'channel.error') {
+            safeSend(client, {
+                type: message.type, channelId: message.channelId,
+                error: message.error, deviceId: meta.deviceId,
+            });
+            return;
+        }
+        safeSend(client, { type: message.type, envelope: message.envelope, deviceId: meta.deviceId });
+        return;
+    }
+}
+function isSecureClientFrame(type) {
+    return type === 'channel.offer' || type === 'channel.confirm' || type === 'secure';
+}
+function isSecureConnectorFrame(type) {
+    return type === 'channel.accept' || type === 'channel.ready'
+        || type === 'channel.error' || type === 'secure';
+}
+function broadcastPresence(clients, connectors, registry) {
+    const payload = {
+        type: 'presence',
+        devices: [...connectors.keys()].sort(),
+        environments: connectorInventory(registry, connectors),
+    };
+    for (const socket of clients.values())
+        safeSend(socket, payload);
+}
+function connectorInventory(registry, connectors) {
+    const inventory = new Map();
+    for (const entry of registry.listApproved()) {
+        if (entry.role !== 'connector' || !entry.routeDeviceId || inventory.has(entry.routeDeviceId))
+            continue;
+        inventory.set(entry.routeDeviceId, { id: entry.routeDeviceId, label: entry.label, online: connectors.has(entry.routeDeviceId) });
+    }
+    return [...inventory.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+class AuthFailureLimiter {
+    limit;
+    windowMs;
+    lockMs;
+    clock;
+    entries;
+    constructor(options = {}) {
+        this.limit = positiveInteger(options.limit, AUTH_FAILURE_LIMIT);
+        this.windowMs = positiveInteger(options.windowMs, AUTH_FAILURE_WINDOW_MS);
+        this.lockMs = positiveInteger(options.lockMs, AUTH_LOCK_MS);
+        this.clock = options.clock || (() => Date.now());
+        this.entries = new LRUCache({
+            max: positiveInteger(options.maxEntries, AUTH_MAX_TRACKED_ADDRESSES),
+        });
+    }
+    isBlocked(address) {
+        const entry = this.entries.get(address);
+        if (!entry)
+            return false;
+        const now = this.clock();
+        if (entry.lockedUntil > now)
+            return true;
+        if (entry.lockedUntil || now - entry.windowStartedAt >= this.windowMs)
+            this.entries.delete(address);
+        return false;
+    }
+    recordFailure(address) {
+        const now = this.clock();
+        let entry = this.entries.get(address);
+        if (!entry || entry.lockedUntil || now - entry.windowStartedAt >= this.windowMs) {
+            entry = { failures: 0, windowStartedAt: now, lockedUntil: 0 };
+            this.entries.set(address, entry);
+        }
+        entry.failures += 1;
+        if (entry.failures >= this.limit)
+            entry.lockedUntil = now + this.lockMs;
+        this.entries.set(address, entry);
+        return entry.lockedUntil > now;
+    }
+    recordSuccess(address) {
+        this.entries.delete(address);
+    }
+}
+function getClientAddress(request, trustProxy) {
+    const peerAddress = String(request.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
+    if (trustProxy && (peerAddress === '127.0.0.1' || peerAddress === '::1')) {
+        // The local Serve proxy appends its client to X-Forwarded-For. Use the
+        // nearest hop, never a caller-supplied first address or an unrelated header.
+        const forwardedFor = String(request.headers['x-forwarded-for'] || '').split(',').at(-1)?.trim() || '';
+        if (isIP(forwardedFor))
+            return forwardedFor;
+        const forwarded = String(request.headers['x-real-ip'] || '').trim();
+        if (isIP(forwarded))
+            return forwarded;
+    }
+    return peerAddress;
+}
+function originAllowed(request, extensionOrigins = []) {
+    const origin = String(request.headers.origin || '').trim();
+    if (!origin)
+        return true;
+    if (/^chrome-extension:\/\/[a-p]{32}$/.test(origin))
+        return extensionOrigins.includes(origin);
+    try {
+        const originUrl = new URL(origin);
+        const host = String(request.headers.host || '').trim().toLocaleLowerCase();
+        return (originUrl.protocol === 'https:' || originUrl.protocol === 'http:')
+            && originUrl.host.toLocaleLowerCase() === host;
+    }
+    catch {
+        return false;
+    }
+}
+function positiveInteger(value, fallback) {
+    return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
+}
+export const internals = {
+    AuthFailureLimiter, currentWebSocketSource, getClientAddress, originAllowed,
+};
